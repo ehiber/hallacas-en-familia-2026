@@ -34,8 +34,19 @@ import {
 } from 'firebase/firestore';
 import { auth, db, appId, isFirebaseConfigured } from './firebase';
 
-const BASE_EQUIV = 56; // 50 hallacas + 12 bollos (12 * 0.5)
+// Receta base: 50 hallacas + 12 bollos
 const BASE_HALLACAS = 50;
+const BASE_BOLLOS = 12;
+// Masa/armado: el bollo usa ~media hallaca de masa/hoja
+const BOLLO_MASA = 0.5;
+// Relleno/guiso: el bollo casi no lleva relleno (0.1–0.2); usamos 0.15
+const BOLLO_RELLENO = 0.15;
+// Costo / participación familiar (unidad de pedido)
+const BOLLO_COSTO = 0.5;
+
+const BASE_MASA = BASE_HALLACAS + BASE_BOLLOS * BOLLO_MASA; // 56
+const BASE_RELLENO = BASE_HALLACAS + BASE_BOLLOS * BOLLO_RELLENO; // 51.8
+const BASE_EQUIV = BASE_MASA; // alias para participación/costo (bollo = 0.5)
 
 const INITIAL_GROUPS = [
   { name: 'Flia Arbona Moreno', hallacas: 20, bollos: 0 },
@@ -45,43 +56,52 @@ const INITIAL_GROUPS = [
 ];
 
 const BASE_INGREDIENTS = [
-  // Masa y Armado
-  { id: 'hojas', category: 'Masa y Armado', name: 'Hojas de plátano', baseQty: 6, unit: 'kg', type: 'weight_kg', scaleBy: 'equiv' },
-  { id: 'harina', category: 'Masa y Armado', name: 'Harina de maíz precocida', baseQty: 2, unit: 'paquete', unitPlural: 'paquetes', type: 'indivisible', scaleBy: 'equiv' },
-  { id: 'onoto', category: 'Masa y Armado', name: 'Onoto (en grano o molido)', baseQty: 100, unit: 'g', type: 'weight_g', scaleBy: 'equiv' },
-  { id: 'pabilo', category: 'Masa y Armado', name: 'Pabilo', baseQty: 2, unit: 'rollo', unitPlural: 'rollos', type: 'indivisible', scaleBy: 'equiv' },
-  { id: 'aceite', category: 'Masa y Armado', name: 'Aceite vegetal (onotado y sofrito)', baseQty: 1, unit: 'litro', unitPlural: 'litros', type: 'indivisible', scaleBy: 'equiv' },
+  // Masa y Armado → bollo cuenta ~0.5
+  { id: 'hojas', category: 'Masa y Armado', name: 'Hojas de plátano', baseQty: 5, unit: 'kg', type: 'weight_kg', scaleBy: 'masa' },
+  { id: 'harina', category: 'Masa y Armado', name: 'Harina de maíz precocida', baseQty: 1.5, unit: 'paquete', unitPlural: 'paquetes', type: 'indivisible', scaleBy: 'masa' },
+  { id: 'onoto', category: 'Masa y Armado', name: 'Onoto (en grano o molido)', baseQty: 100, unit: 'g', type: 'weight_g', scaleBy: 'masa' },
+  { id: 'pabilo', category: 'Masa y Armado', name: 'Pabilo', baseQty: 2, unit: 'rollo', unitPlural: 'rollos', type: 'indivisible', scaleBy: 'masa' },
+  { id: 'aceite', category: 'Masa y Armado', name: 'Aceite vegetal (onotado y sofrito)', baseQty: 1, unit: 'litro', unitPlural: 'litros', type: 'indivisible', scaleBy: 'masa' },
 
-  // Carnes
-  { id: 'res', category: 'Carnes', name: 'Carne de res', baseQty: 2, unit: 'kg', type: 'weight_kg', scaleBy: 'equiv' },
-  { id: 'cochino', category: 'Carnes', name: 'Cochino (cerdo)', baseQty: 1.5, unit: 'kg', type: 'weight_kg', scaleBy: 'equiv' },
-  { id: 'tocino', category: 'Carnes', name: 'Tocino', baseQty: 100, unit: 'g', type: 'weight_g', scaleBy: 'equiv' },
+  // Carnes / relleno → bollo cuenta ~0.15 (casi sin relleno)
+  { id: 'res', category: 'Carnes', name: 'Carne de res', baseQty: 2, unit: 'kg', type: 'weight_kg', scaleBy: 'relleno' },
+  { id: 'cochino', category: 'Carnes', name: 'Cochino (cerdo)', baseQty: 1.5, unit: 'kg', type: 'weight_kg', scaleBy: 'relleno' },
+  { id: 'tocino', category: 'Carnes', name: 'Tocino', baseQty: 100, unit: 'g', type: 'weight_g', scaleBy: 'relleno' },
 
-  // Aliños y Sofrito
-  { id: 'cebolla', category: 'Aliños y Sofrito', name: 'Cebollas redondas', baseQty: 4, unit: 'unidad', unitPlural: 'unidades', type: 'indivisible', scaleBy: 'equiv' },
-  { id: 'ajoporro', category: 'Aliños y Sofrito', name: 'Ajoporro', baseQty: 1, unit: 'unidad', unitPlural: 'unidades', type: 'indivisible', scaleBy: 'equiv' },
-  { id: 'cebollin', category: 'Aliños y Sofrito', name: 'Cebollines grandes', baseQty: 5, unit: 'unidad', unitPlural: 'unidades', type: 'indivisible', scaleBy: 'equiv' },
-  { id: 'celery', category: 'Aliños y Sofrito', name: 'Tallos de celery (apio España)', baseQty: 4, unit: 'tallo', unitPlural: 'tallos', type: 'indivisible', scaleBy: 'equiv' },
-  { id: 'ajo', category: 'Aliños y Sofrito', name: 'Cabezas de ajo', baseQty: 3, unit: 'cabeza', unitPlural: 'cabezas', type: 'indivisible', scaleBy: 'equiv' },
-  { id: 'alcaparras_guiso', category: 'Aliños y Sofrito', name: 'Alcaparras trituradas (guiso)', baseQty: 100, unit: 'g', type: 'weight_g', scaleBy: 'equiv' },
-  { id: 'aji_dulce', category: 'Aliños y Sofrito', name: 'Ajíes dulces', baseQty: 8, unit: 'unidad', unitPlural: 'unidades', type: 'indivisible', scaleBy: 'equiv' },
-  { id: 'pimenton_guiso', category: 'Aliños y Sofrito', name: 'Pimentones rojos (guiso)', baseQty: 3, unit: 'unidad', unitPlural: 'unidades', type: 'indivisible', scaleBy: 'equiv' },
-  { id: 'tomate', category: 'Aliños y Sofrito', name: 'Tomates maduros', baseQty: 4, unit: 'unidad', unitPlural: 'unidades', type: 'indivisible', scaleBy: 'equiv' },
+  // Aliños y Sofrito → relleno
+  { id: 'cebolla', category: 'Aliños y Sofrito', name: 'Cebollas redondas', baseQty: 4, unit: 'unidad', unitPlural: 'unidades', type: 'indivisible', scaleBy: 'relleno' },
+  { id: 'ajoporro', category: 'Aliños y Sofrito', name: 'Ajoporro', baseQty: 1, unit: 'unidad', unitPlural: 'unidades', type: 'indivisible', scaleBy: 'relleno' },
+  { id: 'cebollin', category: 'Aliños y Sofrito', name: 'Cebollines grandes', baseQty: 5, unit: 'unidad', unitPlural: 'unidades', type: 'indivisible', scaleBy: 'relleno' },
+  { id: 'celery', category: 'Aliños y Sofrito', name: 'Tallos de celery (apio España)', baseQty: 4, unit: 'tallo', unitPlural: 'tallos', type: 'indivisible', scaleBy: 'relleno' },
+  { id: 'ajo', category: 'Aliños y Sofrito', name: 'Cabezas de ajo', baseQty: 3, unit: 'cabeza', unitPlural: 'cabezas', type: 'indivisible', scaleBy: 'relleno' },
+  { id: 'alcaparras_guiso', category: 'Aliños y Sofrito', name: 'Alcaparras trituradas (guiso)', baseQty: 100, unit: 'g', type: 'weight_g', scaleBy: 'relleno' },
+  { id: 'aji_dulce', category: 'Aliños y Sofrito', name: 'Ajíes dulces', baseQty: 8, unit: 'unidad', unitPlural: 'unidades', type: 'indivisible', scaleBy: 'relleno' },
+  { id: 'pimenton_guiso', category: 'Aliños y Sofrito', name: 'Pimentones rojos (guiso)', baseQty: 3, unit: 'unidad', unitPlural: 'unidades', type: 'indivisible', scaleBy: 'relleno' },
+  { id: 'tomate', category: 'Aliños y Sofrito', name: 'Tomates maduros', baseQty: 4, unit: 'unidad', unitPlural: 'unidades', type: 'indivisible', scaleBy: 'relleno' },
 
-  // Líquidos y Sazón
-  { id: 'vino', category: 'Líquidos y Sazón', name: 'Vino para cocinar / tinto', baseQty: 1, unit: 'botella', unitPlural: 'botellas', type: 'indivisible', scaleBy: 'equiv' },
-  { id: 'papelon', category: 'Líquidos y Sazón', name: 'Papelón', baseQty: 250, unit: 'g', type: 'weight_g', scaleBy: 'equiv' },
-  { id: 'encurtidos', category: 'Líquidos y Sazón', name: 'Encurtidos en vinagre', baseQty: 250, unit: 'g', type: 'weight_g', scaleBy: 'equiv' },
-  { id: 'caldo', category: 'Líquidos y Sazón', name: 'Caldo (tazas / cubitos)', baseQty: 2, unit: 'taza', unitPlural: 'tazas', type: 'indivisible', scaleBy: 'equiv' },
-  { id: 'sal_pimienta', category: 'Líquidos y Sazón', name: 'Sal y pimienta (al gusto)', baseQty: 1, unit: 'al gusto', type: 'fixed', scaleBy: 'equiv' },
+  // Líquidos y Sazón → relleno
+  { id: 'vino', category: 'Líquidos y Sazón', name: 'Vino para cocinar / tinto', baseQty: 1, unit: 'botella', unitPlural: 'botellas', type: 'indivisible', scaleBy: 'relleno' },
+  { id: 'papelon', category: 'Líquidos y Sazón', name: 'Papelón', baseQty: 250, unit: 'g', type: 'weight_g', scaleBy: 'relleno' },
+  { id: 'encurtidos', category: 'Líquidos y Sazón', name: 'Encurtidos en vinagre', baseQty: 250, unit: 'g', type: 'weight_g', scaleBy: 'relleno' },
+  { id: 'caldo', category: 'Líquidos y Sazón', name: 'Caldo (tazas / cubitos)', baseQty: 2, unit: 'taza', unitPlural: 'tazas', type: 'indivisible', scaleBy: 'relleno' },
+  { id: 'sal_pimienta', category: 'Líquidos y Sazón', name: 'Sal y pimienta (al gusto)', baseQty: 1, unit: 'al gusto', type: 'fixed', scaleBy: 'relleno' },
 
-  // Adornos (escalan solo por hallacas y son opcionales)
+  // Adornos → solo hallacas (opcionales)
   { id: 'aceitunas', category: 'Adornos (Opcionales)', name: 'Aceitunas rellenas', baseQty: 300, unit: 'g', type: 'weight_g', scaleBy: 'hallacas', optional: true },
   { id: 'pasas', category: 'Adornos (Opcionales)', name: 'Pasas', baseQty: 200, unit: 'g', type: 'weight_g', scaleBy: 'hallacas', optional: true },
   { id: 'alcaparras_adorno', category: 'Adornos (Opcionales)', name: 'Alcaparras enteras (adorno)', baseQty: 100, unit: 'g', type: 'weight_g', scaleBy: 'hallacas', optional: true },
   { id: 'pimenton_tiras', category: 'Adornos (Opcionales)', name: 'Pimentón rojo en tiras', baseQty: 2, unit: 'unidad', unitPlural: 'unidades', type: 'indivisible', scaleBy: 'hallacas', optional: true },
   { id: 'cebolla_aros', category: 'Adornos (Opcionales)', name: 'Cebolla en aros', baseQty: 2, unit: 'unidad', unitPlural: 'unidades', type: 'indivisible', scaleBy: 'hallacas', optional: true },
 ];
+
+function ingredientFactor(scaleBy, totals, mermaMult) {
+  const masa = totals.hallacas + totals.bollos * BOLLO_MASA;
+  const relleno = totals.hallacas + totals.bollos * BOLLO_RELLENO;
+  if (scaleBy === 'hallacas') return (totals.hallacas / BASE_HALLACAS) * mermaMult;
+  if (scaleBy === 'relleno') return (relleno / BASE_RELLENO) * mermaMult;
+  // 'masa' o legacy 'equiv'
+  return (masa / BASE_MASA) * mermaMult;
+}
 
 const CATEGORIES = [
   'Masa y Armado',
@@ -600,13 +620,13 @@ export default function App() {
   const totals = useMemo(() => {
     const hallacas = groups.reduce((s, g) => s + (Number(g.hallacas) || 0), 0);
     const bollos = groups.reduce((s, g) => s + (Number(g.bollos) || 0), 0);
-    const equiv = hallacas + bollos * 0.5;
-    return { hallacas, bollos, equiv };
+    const equiv = hallacas + bollos * BOLLO_COSTO;
+    const masa = hallacas + bollos * BOLLO_MASA;
+    const relleno = hallacas + bollos * BOLLO_RELLENO;
+    return { hallacas, bollos, equiv, masa, relleno };
   }, [groups]);
 
   const mermaMult = 1 + (Number(globalConfig.mermaPct) || 0) / 100;
-  const equivFactor = (totals.equiv / BASE_EQUIV) * mermaMult;
-  const hallacasFactor = (totals.hallacas / BASE_HALLACAS) * mermaMult;
   const refRate = Number(globalConfig.exchangeRate) || 50;
 
   // Total Hallacas Cost (USD) & Payers
@@ -650,7 +670,7 @@ export default function App() {
   // Splitwise Settlement
   const settlement = useMemo(() => {
     const rows = groups.map((g) => {
-      const gEquiv = (Number(g.hallacas) || 0) + (Number(g.bollos) || 0) * 0.5;
+      const gEquiv = (Number(g.hallacas) || 0) + (Number(g.bollos) || 0) * BOLLO_COSTO;
       const sharePct = totals.equiv > 0 ? gEquiv / totals.equiv : 0;
       const hallacasOwed = hallacaFinancials.totalUSD * sharePct;
       const hallacasPaid = hallacaFinancials.paidByGroup[g.id] || 0;
@@ -858,7 +878,7 @@ export default function App() {
       if (active.length === 0) return;
       msg += `*${cat}*\n`;
       active.forEach((item) => {
-        const factor = item.scaleBy === 'hallacas' ? hallacasFactor : equivFactor;
+        const factor = ingredientFactor(item.scaleBy, totals, mermaMult);
         const { display } = formatQty(item, factor);
         const checked = globalConfig.itemsState?.[item.id]?.checked ? '✅' : '⬜';
         msg += `${checked} ${item.name}: ${display}\n`;
@@ -1004,7 +1024,7 @@ export default function App() {
               <div className="text-xl font-bold tabular-nums">{totals.bollos}</div>
             </div>
             <div className="kpi-tile">
-              <div className="text-xs text-emerald-100/90 font-medium">Equivalentes (1 bollo = 0.5)</div>
+              <div className="text-xs text-emerald-100/90 font-medium">Equiv. costo (bollo = {BOLLO_COSTO})</div>
               <div className="text-xl font-bold tabular-nums">{totals.equiv}</div>
             </div>
             <div className="kpi-tile">
@@ -1351,7 +1371,7 @@ export default function App() {
                     {items.map((item) => {
                       const st = globalConfig.itemsState?.[item.id] || {};
                       const enabled = item.optional ? st.enabled !== false : true;
-                      const factor = item.scaleBy === 'hallacas' ? hallacasFactor : equivFactor;
+                      const factor = ingredientFactor(item.scaleBy, totals, mermaMult);
                       const { display, exact } = formatQty(item, factor);
                       const usdVal = toUSD(st.amount, st.currency || 'USD', st.rate, refRate);
 
