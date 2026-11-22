@@ -478,6 +478,7 @@ export default function App() {
   });
   const [customItems, setCustomItems] = useState([]);
   const [otherExpenses, setOtherExpenses] = useState([]);
+  const [settlements, setSettlements] = useState([]); // liquidaciones registradas
 
   // UI local states
   const [newGroupName, setNewGroupName] = useState('');
@@ -587,11 +588,23 @@ export default function App() {
       (err) => setDbError(`Error leyendo otras compras: ${err.message}`)
     );
 
+    const unsubSettlements = onSnapshot(
+      colPath('hallacas_settlements'),
+      (snap) => {
+        const list = snap.docs
+          .map((d) => ({ id: d.id, ...d.data() }))
+          .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        setSettlements(list);
+      },
+      (err) => setDbError(`Error leyendo liquidaciones: ${err.message}`)
+    );
+
     return () => {
       unsubGroups();
       unsubConfig();
       unsubCustom();
       unsubOther();
+      unsubSettlements();
     };
   }, [user]);
 
@@ -669,6 +682,15 @@ export default function App() {
 
   // Splitwise Settlement
   const settlement = useMemo(() => {
+    // A paga a B → A suma al aporte neto, B resta (le devolvieron)
+    const settlementNet = {};
+    settlements.forEach((s) => {
+      const amt = parseFloat(s.amount) || 0;
+      if (amt <= 0 || !s.fromId || !s.toId) return;
+      settlementNet[s.fromId] = (settlementNet[s.fromId] || 0) + amt;
+      settlementNet[s.toId] = (settlementNet[s.toId] || 0) - amt;
+    });
+
     const rows = groups.map((g) => {
       const gEquiv = (Number(g.hallacas) || 0) + (Number(g.bollos) || 0) * BOLLO_COSTO;
       const sharePct = totals.equiv > 0 ? gEquiv / totals.equiv : 0;
@@ -687,8 +709,10 @@ export default function App() {
         });
       });
 
+      const purchasePaid = hallacasPaid + otherPaid;
+      const settledNet = settlementNet[g.id] || 0;
       const totalOwed = hallacasOwed + otherOwed;
-      const totalPaid = hallacasPaid + otherPaid;
+      const totalPaid = purchasePaid + settledNet;
       const balance = totalPaid - totalOwed; // > 0 receives, < 0 owes
 
       return {
@@ -698,12 +722,14 @@ export default function App() {
         hallacasOwed,
         otherOwed,
         totalOwed,
+        purchasePaid,
+        settledNet,
         totalPaid,
         balance,
       };
     });
 
-    // Simplify debts
+    // Simplify debts between families that have assigned payers
     const debtors = rows
       .filter((r) => r.balance < -0.01)
       .map((r) => ({ id: r.id, name: r.name, amount: -r.balance }))
@@ -720,7 +746,13 @@ export default function App() {
     while (i < debtors.length && j < creditors.length) {
       const amt = Math.min(debtors[i].amount, creditors[j].amount);
       if (amt > 0.01) {
-        transfers.push({ from: debtors[i].name, to: creditors[j].name, amount: amt });
+        transfers.push({
+          fromId: debtors[i].id,
+          from: debtors[i].name,
+          toId: creditors[j].id,
+          to: creditors[j].name,
+          amount: amt,
+        });
       }
       debtors[i].amount -= amt;
       creditors[j].amount -= amt;
@@ -728,13 +760,35 @@ export default function App() {
       if (creditors[j].amount < 0.01) j++;
     }
 
+    // What remains after family↔family transfers = costs with no payer assigned
+    const unsettledDebts = debtors
+      .filter((d) => d.amount > 0.01)
+      .map((d) => ({ name: d.name, amount: d.amount }));
+    const unsettledTotal = unsettledDebts.reduce((s, d) => s + d.amount, 0);
+
+    const purchasePaidAll = rows.reduce((s, r) => s + r.purchasePaid, 0);
+    const totalOwedAll = rows.reduce((s, r) => s + r.totalOwed, 0);
+    const unassignedUSD = Math.max(0, totalOwedAll - purchasePaidAll);
+
+    const hallacasPaidTotal = Object.values(hallacaFinancials.paidByGroup).reduce((s, v) => s + v, 0);
+    const hallacasUnassigned = Math.max(0, hallacaFinancials.totalUSD - hallacasPaidTotal);
+
     const totalOtherUSD = otherExpenses.reduce(
       (s, e) => s + toUSD(e.amount, e.currency, e.rate, refRate),
       0
     );
 
-    return { rows, transfers, totalOtherUSD, grandTotalUSD: hallacaFinancials.totalUSD + totalOtherUSD };
-  }, [groups, totals, hallacaFinancials, otherExpenses, refRate]);
+    return {
+      rows,
+      transfers,
+      unsettledDebts,
+      unsettledTotal,
+      unassignedUSD,
+      hallacasUnassigned,
+      totalOtherUSD,
+      grandTotalUSD: hallacaFinancials.totalUSD + totalOtherUSD,
+    };
+  }, [groups, totals, hallacaFinancials, otherExpenses, settlements, refRate]);
 
   // Handlers
   const handleUnlock = (e) => {
@@ -861,6 +915,40 @@ export default function App() {
     setOtherPayers([]);
   };
 
+  const handleSettleTransfer = async (transfer) => {
+    if (!transfer?.fromId || !transfer?.toId || !(transfer.amount > 0.01)) return;
+    try {
+      await addDoc(colPath('hallacas_settlements'), {
+        fromId: transfer.fromId,
+        toId: transfer.toId,
+        amount: Number(transfer.amount.toFixed(2)),
+        createdAt: Date.now(),
+      });
+      setCopiedMsg('Liquidación registrada');
+      setTimeout(() => setCopiedMsg(''), 2500);
+    } catch (err) {
+      setDbError(`No se pudo liquidar: ${err.message}`);
+    }
+  };
+
+  const handleSettleAll = async () => {
+    if (!settlement.transfers.length) return;
+    try {
+      for (const t of settlement.transfers) {
+        await addDoc(colPath('hallacas_settlements'), {
+          fromId: t.fromId,
+          toId: t.toId,
+          amount: Number(t.amount.toFixed(2)),
+          createdAt: Date.now(),
+        });
+      }
+      setCopiedMsg('Todas las deudas marcadas como liquidadas');
+      setTimeout(() => setCopiedMsg(''), 2500);
+    } catch (err) {
+      setDbError(`No se pudo liquidar: ${err.message}`);
+    }
+  };
+
   const copyText = (text, label) => {
     navigator.clipboard.writeText(text);
     setCopiedMsg(label);
@@ -908,10 +996,31 @@ export default function App() {
       msg += `• *${r.name}* (${r.hallacas}h / ${r.bollos}b - ${r.sharePct.toFixed(1)}%): Le toca $${r.totalOwed.toFixed(2)} | Pagó $${r.totalPaid.toFixed(2)}\n`;
     });
     if (settlement.transfers.length > 0) {
-      msg += `\n💸 *Liquidación (Quién transfiere a quién):*\n`;
+      msg += `\n💸 *Por liquidar entre familias:*\n`;
       settlement.transfers.forEach((t) => {
         msg += `➡️ *${t.from}* → *${t.to}*: *$${t.amount.toFixed(2)}* (Bs ${(t.amount * refRate).toFixed(2)})\n`;
       });
+    }
+    if (settlements.length > 0) {
+      msg += `\n✅ *Ya liquidado:*\n`;
+      settlements.forEach((s) => {
+        const from = groups.find((g) => g.id === s.fromId)?.name || '?';
+        const to = groups.find((g) => g.id === s.toId)?.name || '?';
+        msg += `• ${from} → ${to}: $${Number(s.amount).toFixed(2)}\n`;
+      });
+    }
+    if (settlement.unassignedUSD > 0.01) {
+      msg += `\n⚠️ *Falta asignar quién pagó:* $${settlement.unassignedUSD.toFixed(2)}`;
+      if (settlement.hallacasUnassigned > 0.01) {
+        msg += ` (hallacas sin pagador: $${settlement.hallacasUnassigned.toFixed(2)})`;
+      }
+      msg += `\nHasta asignarlo, esos saldos no se pueden liquidar entre familias.\n`;
+      if (settlement.unsettledDebts?.length) {
+        msg += `Pendiente:\n`;
+        settlement.unsettledDebts.forEach((d) => {
+          msg += `• ${d.name}: $${d.amount.toFixed(2)}\n`;
+        });
+      }
     }
     copyText(msg, 'Resumen copiado para WhatsApp');
   };
@@ -1723,7 +1832,14 @@ export default function App() {
                       <td className="px-4 py-3 text-right tabular-nums">${r.hallacasOwed.toFixed(2)}</td>
                       <td className="px-4 py-3 text-right tabular-nums">${r.otherOwed.toFixed(2)}</td>
                       <td className="px-4 py-3 text-right font-bold tabular-nums">${r.totalOwed.toFixed(2)}</td>
-                      <td className="px-4 py-3 text-right text-emerald-700 tabular-nums">${r.totalPaid.toFixed(2)}</td>
+                      <td className="px-4 py-3 text-right text-emerald-700 tabular-nums">
+                        ${r.totalPaid.toFixed(2)}
+                        {Math.abs(r.settledNet) > 0.01 && (
+                          <div className="text-[10px] font-normal text-stone-400">
+                            incl. liq. {r.settledNet >= 0 ? '+' : ''}{r.settledNet.toFixed(2)}
+                          </div>
+                        )}
+                      </td>
                       <td className="px-4 py-3 text-right">
                         <span
                           className={`inline-flex font-bold tabular-nums px-2 py-0.5 rounded-lg border ${
@@ -1744,25 +1860,120 @@ export default function App() {
             {/* Splitwise transfers */}
             <div className="card p-4 space-y-3">
               <h3 className="font-bold tracking-tight text-stone-800 text-sm">Liquidación Inteligente (Quién le transfiere a quién)</h3>
-              {settlement.transfers.length === 0 ? (
+              <p className="text-xs text-stone-500">
+                Solo mueve plata entre familias cuando hay alguien con saldo a favor (pagó de más) y otras que deben.
+                Si un gasto no tiene “quién pagó”, ese monto no puede liquidarse aquí.
+              </p>
+
+              {settlement.unassignedUSD > 0.01 && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-3 text-sm text-amber-950 space-y-1">
+                  <div className="font-semibold flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4 shrink-0" />
+                    Falta asignar quién pagó ${settlement.unassignedUSD.toFixed(2)}
+                  </div>
+                  {settlement.hallacasUnassigned > 0.01 && (
+                    <p className="text-xs text-amber-800">
+                      De hallacas hay <strong className="tabular-nums">${settlement.hallacasUnassigned.toFixed(2)}</strong> en costos
+                      sin pagador. Ve a <strong>Lista de Compras</strong> y marca quién(es) pagó(aron) cada ítem o factura.
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {settlement.transfers.length === 0 && settlement.unassignedUSD <= 0.01 ? (
                 <p className="text-sm text-stone-500">
-                  Asigna quién pagó cada compra o factura para calcular las transferencias automáticamente.
+                  {settlement.rows.every((r) => Math.abs(r.balance) < 0.01)
+                    ? 'Todo está cuadrado: nadie se debe entre sí.'
+                    : 'Asigna quién pagó cada compra o factura para calcular las transferencias automáticamente.'}
                 </p>
-              ) : (
+              ) : settlement.transfers.length > 0 ? (
                 <div className="space-y-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-xs font-semibold uppercase tracking-wider text-stone-500">Por liquidar entre familias</div>
+                    {settlement.transfers.length > 1 && (
+                      <button type="button" onClick={handleSettleAll} className="btn-ghost">
+                        <CheckCircle2 className="w-3.5 h-3.5" /> Liquidar todas
+                      </button>
+                    )}
+                  </div>
                   {settlement.transfers.map((t, idx) => (
-                    <div key={idx} className="transfer-card group">
-                      <div className="flex items-center gap-2 text-sm font-semibold text-stone-800">
-                        <span>{t.from}</span>
-                        <ArrowRight className="w-4 h-4 text-emerald-600 transfer-arrow" />
-                        <span>{t.to}</span>
+                    <div key={`${t.fromId}-${t.toId}-${idx}`} className="transfer-card group">
+                      <div className="flex items-center gap-2 text-sm font-semibold text-stone-800 min-w-0">
+                        <span className="truncate">{t.from}</span>
+                        <ArrowRight className="w-4 h-4 text-emerald-600 transfer-arrow shrink-0" />
+                        <span className="truncate">{t.to}</span>
                       </div>
-                      <div className="text-right">
-                        <div className="font-bold text-emerald-800 tabular-nums">${t.amount.toFixed(2)}</div>
-                        <div className="text-xs text-emerald-700 tabular-nums">Bs {(t.amount * refRate).toFixed(2)}</div>
+                      <div className="flex items-center gap-3 shrink-0">
+                        <div className="text-right">
+                          <div className="font-bold text-emerald-800 tabular-nums">${t.amount.toFixed(2)}</div>
+                          <div className="text-xs text-emerald-700 tabular-nums">Bs {(t.amount * refRate).toFixed(2)}</div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleSettleTransfer(t)}
+                          className="btn-primary text-xs py-1.5 px-3"
+                          title="Registrar que este pago ya se hizo"
+                        >
+                          <Check className="w-3.5 h-3.5" /> Liquidar
+                        </button>
                       </div>
                     </div>
                   ))}
+                </div>
+              ) : null}
+
+              {settlement.unsettledTotal > 0.01 && (
+                <div className="space-y-2 pt-1">
+                  <div className="text-xs font-semibold uppercase tracking-wider text-stone-500">
+                    Aún pendiente (${settlement.unsettledTotal.toFixed(2)}) — sin destinatario en el grupo
+                  </div>
+                  {settlement.unsettledDebts.map((d) => (
+                    <div
+                      key={d.name}
+                      className="flex items-center justify-between gap-2 rounded-xl border border-rose-200 bg-rose-50/60 px-3.5 py-2.5 text-sm"
+                    >
+                      <span className="font-medium text-stone-800">{d.name}</span>
+                      <span className="font-bold text-rose-700 tabular-nums">debe ${d.amount.toFixed(2)}</span>
+                    </div>
+                  ))}
+                  <p className="text-xs text-stone-500">
+                    Ese pendiente es el dinero de gastos sin “quién pagó”. Cuando asignes al pagador, aquí aparecerán
+                    las transferencias completas (quién le paga a quién).
+                  </p>
+                </div>
+              )}
+
+              {settlements.length > 0 && (
+                <div className="space-y-2 pt-2 border-t border-stone-100">
+                  <div className="text-xs font-semibold uppercase tracking-wider text-stone-500">Ya liquidado</div>
+                  {settlements.map((s) => {
+                    const from = groups.find((g) => g.id === s.fromId)?.name || '¿?';
+                    const to = groups.find((g) => g.id === s.toId)?.name || '¿?';
+                    return (
+                      <div
+                        key={s.id}
+                        className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-stone-200 bg-stone-50/80 px-3.5 py-2.5 text-sm"
+                      >
+                        <div className="flex items-center gap-2 font-medium text-stone-700 min-w-0">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                          <span className="truncate">{from}</span>
+                          <ArrowRight className="w-3.5 h-3.5 text-stone-400 shrink-0" />
+                          <span className="truncate">{to}</span>
+                        </div>
+                        <div className="flex items-center gap-3 shrink-0">
+                          <span className="font-bold text-stone-800 tabular-nums">${Number(s.amount).toFixed(2)}</span>
+                          <button
+                            type="button"
+                            onClick={() => deleteDoc(docPath('hallacas_settlements', s.id))}
+                            className="p-1.5 rounded-lg text-stone-400 hover:text-rose-700 hover:bg-rose-50 active:scale-95 transition-all duration-150"
+                            title="Deshacer liquidación"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>
