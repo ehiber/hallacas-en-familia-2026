@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Users,
   ShoppingCart,
@@ -19,6 +19,7 @@ import {
   ArrowRight,
   AlertCircle,
   Sparkles,
+  ChevronDown,
 } from 'lucide-react';
 import { signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import {
@@ -131,6 +132,269 @@ function toUSD(amount, currency, rate, fallbackRate) {
   return num;
 }
 
+/** Legacy payerId → payers[]; empty amount means "paid the full total". */
+function resolvePayers(record = {}) {
+  if (Array.isArray(record.payers) && record.payers.length > 0) {
+    return record.payers.map((p) => ({
+      groupId: p.groupId || '',
+      amount: p.amount ?? '',
+    }));
+  }
+  if (record.payerId) return [{ groupId: record.payerId, amount: '' }];
+  return [];
+}
+
+/** Convert payers into USD contributions per group. */
+function payerContributions(payers, totalUSD, currency, rate, fallbackRate) {
+  const list = (payers || []).filter((p) => p.groupId);
+  if (list.length === 0) return [];
+
+  const withExplicit = list.filter((p) => parseFloat(p.amount) > 0);
+  if (withExplicit.length === 0 && list.length === 1) {
+    return [{ groupId: list[0].groupId, usd: totalUSD }];
+  }
+
+  return withExplicit.map((p) => ({
+    groupId: p.groupId,
+    usd: toUSD(p.amount, currency || 'USD', rate, fallbackRate),
+  }));
+}
+
+function formatPayersSummary(payers, groups, currency = 'USD') {
+  const list = (payers || []).filter((p) => p.groupId);
+  if (list.length === 0) return '';
+  const symbol = currency === 'BS' ? 'Bs' : '$';
+  return list
+    .map((p) => {
+      const name = groups.find((g) => g.id === p.groupId)?.name || '?';
+      const amt = parseFloat(p.amount);
+      return Number.isFinite(amt) && amt > 0 ? `${name} ${symbol}${amt}` : name;
+    })
+    .join(' · ');
+}
+
+function Select({
+  value,
+  onChange,
+  options,
+  placeholder = 'Seleccionar',
+  size = 'md',
+  className = '',
+  disabled = false,
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    const onDoc = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, []);
+
+  const selected = options.find((o) => String(o.value) === String(value));
+  const triggerClass = size === 'sm' ? 'select-trigger-sm' : 'select-trigger';
+
+  return (
+    <div ref={ref} className={`relative ${className}`}>
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => !disabled && setOpen((v) => !v)}
+        className={`${triggerClass} ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+      >
+        <span className={`truncate ${selected ? '' : 'text-stone-400'}`}>
+          {selected?.label || placeholder}
+        </span>
+        <ChevronDown className={`w-3.5 h-3.5 shrink-0 text-stone-400 transition ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && (
+        <div className="select-menu">
+          {placeholder && (
+            <button
+              type="button"
+              className={`select-option ${!value ? 'select-option-active' : ''}`}
+              onClick={() => {
+                onChange('');
+                setOpen(false);
+              }}
+            >
+              {placeholder}
+            </button>
+          )}
+          {options.map((o) => (
+            <button
+              key={String(o.value)}
+              type="button"
+              className={`select-option ${String(o.value) === String(value) ? 'select-option-active' : ''}`}
+              onClick={() => {
+                onChange(o.value);
+                setOpen(false);
+              }}
+            >
+              {o.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PayersControl({
+  groups,
+  payers = [],
+  onChange,
+  totalAmount,
+  currency = 'USD',
+  compact = false,
+}) {
+  const [open, setOpen] = useState(!compact);
+  const total = parseFloat(totalAmount) || 0;
+  const paidSum = payers.reduce((s, p) => s + (parseFloat(p.amount) || 0), 0);
+  const remaining = total > 0 ? total - paidSum : 0;
+  const symbol = currency === 'BS' ? 'Bs' : '$';
+  const summary = formatPayersSummary(payers, groups, currency);
+  const usedIds = new Set(payers.map((p) => p.groupId).filter(Boolean));
+
+  const updateRow = (idx, patch) => {
+    onChange(payers.map((p, i) => (i === idx ? { ...p, ...patch } : p)));
+  };
+
+  const removeRow = (idx) => onChange(payers.filter((_, i) => i !== idx));
+
+  const addRow = () => {
+    const next = groups.find((g) => !usedIds.has(g.id));
+    if (!next) return;
+    const amount = remaining > 0.009 ? Number(remaining.toFixed(2)) : '';
+    onChange([...payers, { groupId: next.id, amount }]);
+    if (compact) setOpen(true);
+  };
+
+  const fillOne = (groupId) => {
+    onChange([{ groupId, amount: total > 0 ? Number(total.toFixed(2)) : '' }]);
+    if (compact) setOpen(true);
+  };
+
+  const editor = (
+    <div className={`space-y-2 ${compact ? 'pt-2' : ''}`}>
+      {payers.length === 0 && (
+        <p className="text-xs text-stone-500">
+          Puedes repartir el pago entre varias familias con montos distintos.
+        </p>
+      )}
+      {payers.map((p, idx) => {
+        const opts = groups
+          .filter((g) => g.id === p.groupId || !usedIds.has(g.id))
+          .map((g) => ({ value: g.id, label: g.name }));
+        return (
+          <div key={idx} className="flex flex-wrap items-center gap-2">
+            <Select
+              size={compact ? 'sm' : 'md'}
+              className="flex-1 min-w-[140px]"
+              value={p.groupId}
+              onChange={(v) => updateRow(idx, { groupId: v })}
+              options={opts}
+              placeholder="Familia"
+            />
+            <div className="relative">
+              <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-xs text-stone-400 pointer-events-none">
+                {symbol}
+              </span>
+              <input
+                type="number"
+                step="0.01"
+                min="0"
+                placeholder={payers.length === 1 && total > 0 ? String(total) : 'Monto'}
+                value={p.amount}
+                onChange={(e) => updateRow(idx, { amount: e.target.value })}
+                className={`${compact ? 'field-sm' : 'field'} w-[7.5rem] pl-7`}
+              />
+            </div>
+            <button
+              type="button"
+              onClick={() => removeRow(idx)}
+              className="p-1.5 rounded-lg text-stone-400 hover:text-red-600 hover:bg-red-50 transition"
+              title="Quitar"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        );
+      })}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={addRow}
+          disabled={usedIds.size >= groups.length}
+          className="btn-ghost disabled:opacity-40"
+        >
+          <Plus className="w-3.5 h-3.5" /> Agregar quien pagó
+        </button>
+        {groups.length > 0 && payers.length === 0 && (
+          <Select
+            size="sm"
+            className="min-w-[160px]"
+            value=""
+            onChange={(v) => v && fillOne(v)}
+            options={groups.map((g) => ({ value: g.id, label: g.name }))}
+            placeholder="O asignar a uno solo"
+          />
+        )}
+      </div>
+
+      {total > 0 && (
+        <div
+          className={`text-xs font-medium ${
+            Math.abs(remaining) < 0.02
+              ? 'text-emerald-700'
+              : remaining > 0
+                ? 'text-amber-800'
+                : 'text-red-600'
+          }`}
+        >
+          {Math.abs(remaining) < 0.02
+            ? `Cubierto: ${symbol}${total.toFixed(2)}`
+            : remaining > 0
+              ? `Restante: ${symbol}${remaining.toFixed(2)}`
+              : `Excede por: ${symbol}${Math.abs(remaining).toFixed(2)}`}
+        </div>
+      )}
+    </div>
+  );
+
+  if (!compact) {
+    return (
+      <div className="space-y-2">
+        <div className="label-xs mb-0">¿Quién(es) pagó(aron)?</div>
+        {editor}
+      </div>
+    );
+  }
+
+  return (
+    <div className="w-full min-w-[180px] max-w-[280px]">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="select-trigger-sm w-full text-left"
+      >
+        <span className={`truncate ${summary ? 'text-stone-800' : 'text-stone-400'}`}>
+          {summary || '¿Quién pagó?'}
+        </span>
+        <ChevronDown className={`w-3.5 h-3.5 shrink-0 text-stone-400 transition ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && (
+        <div className="mt-1.5 rounded-xl border border-stone-200 bg-gradient-to-b from-white to-stone-50 p-2.5 shadow-md shadow-stone-900/5">
+          {editor}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function CountInput({ value, onChange, label }) {
   const [text, setText] = useState(String(value));
   useEffect(() => {
@@ -148,7 +412,7 @@ function CountInput({ value, onChange, label }) {
       <button
         type="button"
         onClick={() => onChange(Math.max(0, value - 1))}
-        className="w-8 h-8 rounded-lg bg-stone-100 hover:bg-stone-200 flex items-center justify-center text-stone-700 transition"
+        className="min-w-8 min-h-8 w-8 h-8 rounded-lg bg-stone-100 hover:bg-stone-200 flex items-center justify-center text-stone-700 transition-all duration-150 active:scale-95"
         aria-label={`Restar ${label}`}
       >
         <Minus className="w-4 h-4" />
@@ -160,12 +424,12 @@ function CountInput({ value, onChange, label }) {
         onChange={(e) => setText(e.target.value)}
         onBlur={() => commit(text)}
         onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
-        className="w-14 text-center font-semibold text-stone-800 bg-white border border-stone-200 rounded-lg py-1 focus:outline-none focus:ring-2 focus:ring-amber-500"
+        className="w-14 text-center font-semibold tabular-nums text-stone-800 bg-white border border-stone-200 rounded-lg py-1 focus:outline-none focus:ring-2 focus:ring-emerald-600"
       />
       <button
         type="button"
         onClick={() => onChange(value + 1)}
-        className="w-8 h-8 rounded-lg bg-amber-100 hover:bg-amber-200 flex items-center justify-center text-amber-900 transition"
+        className="min-w-8 min-h-8 w-8 h-8 rounded-lg bg-emerald-50 hover:bg-emerald-100 flex items-center justify-center text-emerald-800 transition-all duration-150 active:scale-95"
         aria-label={`Sumar ${label}`}
       >
         <Plus className="w-4 h-4" />
@@ -210,14 +474,14 @@ export default function App() {
   const [invAmount, setInvAmount] = useState('');
   const [invCurrency, setInvCurrency] = useState('USD');
   const [invRate, setInvRate] = useState('');
-  const [invPayer, setInvPayer] = useState('');
+  const [invPayers, setInvPayers] = useState([]);
 
   // Other expense form
   const [otherDesc, setOtherDesc] = useState('');
   const [otherAmount, setOtherAmount] = useState('');
   const [otherCurrency, setOtherCurrency] = useState('USD');
   const [otherRate, setOtherRate] = useState('');
-  const [otherPayer, setOtherPayer] = useState('');
+  const [otherPayers, setOtherPayers] = useState([]);
   const [otherSplits, setOtherSplits] = useState({}); // { groupId: pct }
 
   const [copiedMsg, setCopiedMsg] = useState('');
@@ -349,26 +613,34 @@ export default function App() {
   const hallacaFinancials = useMemo(() => {
     let totalUSD = 0;
     const paidByGroup = {};
+    const addPaid = (contribs) => {
+      contribs.forEach(({ groupId, usd }) => {
+        if (!groupId || usd <= 0) return;
+        paidByGroup[groupId] = (paidByGroup[groupId] || 0) + usd;
+      });
+    };
 
     if (globalConfig.costMode === 'invoices') {
       (globalConfig.hallacaInvoices || []).forEach((inv) => {
         const usd = toUSD(inv.amount, inv.currency, inv.rate, refRate);
         totalUSD += usd;
-        if (inv.payerId) paidByGroup[inv.payerId] = (paidByGroup[inv.payerId] || 0) + usd;
+        addPaid(payerContributions(resolvePayers(inv), usd, inv.currency, inv.rate, refRate));
       });
     } else {
       const state = globalConfig.itemsState || {};
       BASE_INGREDIENTS.forEach((item) => {
         const st = state[item.id] || {};
         if (item.optional && st.enabled === false) return;
-        const usd = toUSD(st.amount, st.currency || 'USD', st.rate, refRate);
+        const currency = st.currency || 'USD';
+        const usd = toUSD(st.amount, currency, st.rate, refRate);
         totalUSD += usd;
-        if (st.payerId) paidByGroup[st.payerId] = (paidByGroup[st.payerId] || 0) + usd;
+        addPaid(payerContributions(resolvePayers(st), usd, currency, st.rate, refRate));
       });
       customItems.forEach((ci) => {
-        const usd = toUSD(ci.amount, ci.currency || 'USD', ci.rate, refRate);
+        const currency = ci.currency || 'USD';
+        const usd = toUSD(ci.amount, currency, ci.rate, refRate);
         totalUSD += usd;
-        if (ci.payerId) paidByGroup[ci.payerId] = (paidByGroup[ci.payerId] || 0) + usd;
+        addPaid(payerContributions(resolvePayers(ci), usd, currency, ci.rate, refRate));
       });
     }
 
@@ -389,7 +661,10 @@ export default function App() {
         const expUSD = toUSD(exp.amount, exp.currency, exp.rate, refRate);
         const pct = Number(exp.splits?.[g.id]) || 0;
         otherOwed += expUSD * (pct / 100);
-        if (exp.payerId === g.id) otherPaid += expUSD;
+        const contribs = payerContributions(resolvePayers(exp), expUSD, exp.currency, exp.rate, refRate);
+        contribs.forEach((c) => {
+          if (c.groupId === g.id) otherPaid += c.usd;
+        });
       });
 
       const totalOwed = hallacasOwed + otherOwed;
@@ -493,13 +768,15 @@ export default function App() {
   const handleAddInvoice = async (e) => {
     e.preventDefault();
     if (!invDesc.trim() || !invAmount) return;
+    const cleanPayers = invPayers.filter((p) => p.groupId);
     const newInv = {
       id: Date.now().toString(),
       description: invDesc.trim(),
       amount: parseFloat(invAmount) || 0,
       currency: invCurrency,
       rate: invCurrency === 'BS' ? parseFloat(invRate) || refRate : refRate,
-      payerId: invPayer,
+      payers: cleanPayers,
+      payerId: cleanPayers[0]?.groupId || '',
     };
     await updateGlobal({
       hallacaInvoices: [...(globalConfig.hallacaInvoices || []), newInv],
@@ -507,6 +784,7 @@ export default function App() {
     setInvDesc('');
     setInvAmount('');
     setInvRate('');
+    setInvPayers([]);
   };
 
   const handleDeleteInvoice = async (id) => {
@@ -546,18 +824,21 @@ export default function App() {
   const handleAddOtherExpense = async (e) => {
     e.preventDefault();
     if (!otherDesc.trim() || !otherAmount || Math.abs(otherSplitTotal - 100) > 0.5) return;
+    const cleanPayers = otherPayers.filter((p) => p.groupId);
     await addDoc(colPath('hallacas_other_expenses'), {
       description: otherDesc.trim(),
       amount: parseFloat(otherAmount) || 0,
       currency: otherCurrency,
       rate: otherCurrency === 'BS' ? parseFloat(otherRate) || refRate : refRate,
-      payerId: otherPayer,
+      payers: cleanPayers,
+      payerId: cleanPayers[0]?.groupId || '',
       splits: otherSplits,
       createdAt: Date.now(),
     });
     setOtherDesc('');
     setOtherAmount('');
     setOtherRate('');
+    setOtherPayers([]);
   };
 
   const copyText = (text, label) => {
@@ -618,11 +899,11 @@ export default function App() {
   // Config missing guard
   if (!isFirebaseConfigured) {
     return (
-      <div className="min-h-screen flex items-center justify-center p-6 bg-amber-50">
-        <div className="max-w-md w-full bg-white rounded-2xl shadow-lg border border-amber-200 p-6 space-y-4">
-          <div className="flex items-center gap-3 text-amber-700">
+      <div className="min-h-screen flex items-center justify-center p-6 bg-stone-50">
+        <div className="max-w-md w-full card p-6 space-y-4">
+          <div className="flex items-center gap-3 text-emerald-800">
             <AlertCircle className="w-7 h-7" />
-            <h1 className="text-xl font-bold">Falta configurar Firebase</h1>
+            <h1 className="text-xl font-bold tracking-tight">Falta configurar Firebase</h1>
           </div>
           <p className="text-sm text-stone-600">
             Agrega tus variables de entorno de Firebase en el archivo <code className="bg-stone-100 px-1.5 py-0.5 rounded">.env</code> (o en Vercel → Environment Variables) siguiendo el archivo <code className="bg-stone-100 px-1.5 py-0.5 rounded">README.md</code>.
@@ -635,16 +916,16 @@ export default function App() {
   // Password Gate
   if (!unlocked) {
     return (
-      <div className="min-h-screen flex items-center justify-center p-4 bg-gradient-to-br from-amber-50 via-orange-50 to-red-50">
+      <div className="min-h-screen flex items-center justify-center p-4 bg-gradient-to-br from-emerald-950 via-emerald-900 to-stone-900">
         <form
           onSubmit={handleUnlock}
-          className="w-full max-w-sm bg-white rounded-2xl shadow-xl border border-amber-100 p-7 space-y-5"
+          className="w-full max-w-sm bg-white rounded-3xl shadow-2xl border border-white/10 p-8 space-y-5"
         >
           <div className="text-center space-y-2">
-            <div className="w-14 h-14 mx-auto rounded-2xl bg-amber-100 text-amber-800 flex items-center justify-center">
+            <div className="w-14 h-14 mx-auto rounded-2xl bg-emerald-100 text-emerald-800 flex items-center justify-center">
               <Lock className="w-7 h-7" />
             </div>
-            <h1 className="text-2xl font-bold text-stone-800">Hallacas en Familia 2026</h1>
+            <h1 className="text-2xl font-bold tracking-tight text-stone-800">Hallacas en Familia 2026</h1>
             <p className="text-sm text-stone-500">Ingresa la clave familiar para ver y editar en tiempo real.</p>
           </div>
           <div>
@@ -656,17 +937,14 @@ export default function App() {
                 setPasswordInput(e.target.value);
                 setPasswordError(false);
               }}
-              className="w-full px-4 py-3 rounded-xl border border-stone-200 focus:outline-none focus:ring-2 focus:ring-amber-500 text-center text-lg"
+              className="field text-center text-lg focus:ring-emerald-600"
               autoFocus
             />
             {passwordError && (
-              <p className="text-xs text-red-600 text-center mt-2">Clave incorrecta. Intenta de nuevo.</p>
+              <p className="text-xs text-rose-700 text-center mt-2">Clave incorrecta. Intenta de nuevo.</p>
             )}
           </div>
-          <button
-            type="submit"
-            className="w-full py-3 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-semibold transition shadow-sm"
-          >
+          <button type="submit" className="btn-primary w-full py-3">
             Entrar
           </button>
         </form>
@@ -675,31 +953,31 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen pb-16">
+    <div className="min-h-screen pb-16 bg-stone-50">
       {/* Header */}
-      <header className="bg-gradient-to-r from-amber-800 via-amber-700 to-orange-700 text-white shadow-md">
+      <header className="bg-gradient-to-br from-emerald-950 via-emerald-900 to-teal-950 text-white shadow-lg">
         <div className="max-w-5xl mx-auto px-4 py-5 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2">
-                <Sparkles className="w-6 h-6 text-amber-300" />
+                <Sparkles className="w-6 h-6 text-amber-400" />
                 Hallacas en Familia 2026
               </h1>
-              <p className="text-xs text-amber-100 flex items-center gap-1.5 mt-0.5">
+              <p className="text-xs text-emerald-100/90 flex items-center gap-1.5 mt-0.5">
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
                 En vivo • Base de datos compartida
               </p>
             </div>
 
             <div className="flex items-center gap-2">
-              <div className="flex items-center gap-1.5 bg-white/15 px-3 py-1.5 rounded-xl text-sm">
-                <span className="text-amber-100 text-xs">Tasa Bs/$:</span>
+              <div className="flex items-center gap-1.5 bg-white/15 backdrop-blur-sm px-3 py-1.5 rounded-xl text-sm border border-white/10">
+                <span className="text-emerald-100 text-xs font-medium">Tasa Bs/$:</span>
                 <input
                   type="number"
                   step="0.01"
                   value={globalConfig.exchangeRate || ''}
                   onChange={(e) => updateGlobal({ exchangeRate: parseFloat(e.target.value) || 0 })}
-                  className="w-20 bg-white/90 text-stone-900 font-semibold px-2 py-0.5 rounded-lg text-sm focus:outline-none"
+                  className="w-20 bg-white/90 text-stone-900 font-semibold tabular-nums px-2 py-0.5 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400"
                 />
               </div>
               <button
@@ -707,7 +985,7 @@ export default function App() {
                   localStorage.removeItem('hallacas_unlocked');
                   setUnlocked(false);
                 }}
-                className="p-2 rounded-xl bg-white/10 hover:bg-white/20 transition"
+                className="p-2 rounded-xl bg-white/10 hover:bg-white/20 transition-all duration-150 active:scale-95"
                 title="Bloquear"
               >
                 <Unlock className="w-4 h-4" />
@@ -717,21 +995,21 @@ export default function App() {
 
           {/* KPI Strip */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
-            <div className="bg-white/10 rounded-xl p-3">
-              <div className="text-xs text-amber-100">Hallacas</div>
-              <div className="text-xl font-bold">{totals.hallacas}</div>
+            <div className="kpi-tile">
+              <div className="text-xs text-emerald-100/90 font-medium">Hallacas</div>
+              <div className="text-xl font-bold tabular-nums">{totals.hallacas}</div>
             </div>
-            <div className="bg-white/10 rounded-xl p-3">
-              <div className="text-xs text-amber-100">Bollos</div>
-              <div className="text-xl font-bold">{totals.bollos}</div>
+            <div className="kpi-tile">
+              <div className="text-xs text-emerald-100/90 font-medium">Bollos</div>
+              <div className="text-xl font-bold tabular-nums">{totals.bollos}</div>
             </div>
-            <div className="bg-white/10 rounded-xl p-3">
-              <div className="text-xs text-amber-100">Equivalentes (1 bollo = 0.5)</div>
-              <div className="text-xl font-bold">{totals.equiv}</div>
+            <div className="kpi-tile">
+              <div className="text-xs text-emerald-100/90 font-medium">Equivalentes (1 bollo = 0.5)</div>
+              <div className="text-xl font-bold tabular-nums">{totals.equiv}</div>
             </div>
-            <div className="bg-white/10 rounded-xl p-3">
-              <div className="text-xs text-amber-100">Total General</div>
-              <div className="text-xl font-bold">${settlement.grandTotalUSD.toFixed(2)}</div>
+            <div className="kpi-tile">
+              <div className="text-xs text-emerald-100/90 font-medium">Total General</div>
+              <div className="text-xl font-bold tabular-nums">${settlement.grandTotalUSD.toFixed(2)}</div>
             </div>
           </div>
         </div>
@@ -740,16 +1018,16 @@ export default function App() {
       {/* Error banner */}
       {dbError && (
         <div className="max-w-5xl mx-auto px-4 mt-4">
-          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-xl text-sm flex items-center justify-between">
+          <div className="bg-rose-50 border border-rose-200 text-rose-700 px-4 py-3 rounded-xl text-sm flex items-center justify-between">
             <span>{dbError}</span>
-            <button onClick={() => setDbError('')}><X className="w-4 h-4" /></button>
+            <button onClick={() => setDbError('')} className="active:scale-95 transition-all duration-150"><X className="w-4 h-4" /></button>
           </div>
         </div>
       )}
 
       {/* Toast */}
       {copiedMsg && (
-        <div className="fixed bottom-5 right-5 z-50 bg-emerald-700 text-white px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-2 text-sm font-medium">
+        <div className="fixed bottom-5 right-5 z-50 bg-emerald-900 text-white px-4 py-2.5 rounded-xl shadow-xl flex items-center gap-2 text-sm font-medium animate-slide-up">
           <CheckCircle2 className="w-4 h-4" /> {copiedMsg}
         </div>
       )}
@@ -769,10 +1047,10 @@ export default function App() {
               <button
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id)}
-                className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold whitespace-nowrap transition ${
+                className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold whitespace-nowrap transition-all duration-150 active:scale-95 ${
                   active
-                    ? 'bg-amber-700 text-white shadow-sm'
-                    : 'bg-white text-stone-600 hover:bg-amber-50 border border-stone-200'
+                    ? 'bg-emerald-800 text-white shadow-sm'
+                    : 'bg-white text-stone-600 hover:bg-emerald-50 hover:text-emerald-800 border border-stone-200'
                 }`}
               >
                 <Icon className="w-4 h-4" />
@@ -787,56 +1065,50 @@ export default function App() {
       <main className="max-w-5xl mx-auto px-4 mt-4 space-y-6">
         {/* TAB 1: GRUPOS */}
         {activeTab === 'grupos' && (
-          <div className="space-y-4">
+          <div key="grupos" className="space-y-4 animate-fade-in">
             <form
               onSubmit={handleAddGroup}
-              className="bg-white rounded-2xl border border-stone-200 p-4 shadow-sm flex flex-wrap gap-3 items-end"
+              className="card p-4 flex flex-wrap gap-3 items-end"
             >
               <div className="flex-1 min-w-[180px]">
-                <label className="block text-xs font-medium text-stone-500 mb-1">Nuevo grupo familiar</label>
+                <label className="label-xs">Nuevo grupo familiar</label>
                 <input
                   type="text"
                   placeholder="Ej. Flia Pérez"
                   value={newGroupName}
                   onChange={(e) => setNewGroupName(e.target.value)}
-                  className="w-full px-3 py-2 rounded-xl border border-stone-200 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500"
+                  className="field"
                 />
               </div>
               <div className="w-24">
-                <label className="block text-xs font-medium text-stone-500 mb-1">Hallacas</label>
+                <label className="label-xs">Hallacas</label>
                 <input
                   type="number"
                   min="0"
                   value={newGroupHallacas}
                   onChange={(e) => setNewGroupHallacas(e.target.value)}
-                  className="w-full px-3 py-2 rounded-xl border border-stone-200 text-sm"
+                  className="field tabular-nums"
                 />
               </div>
               <div className="w-24">
-                <label className="block text-xs font-medium text-stone-500 mb-1">Bollos</label>
+                <label className="label-xs">Bollos</label>
                 <input
                   type="number"
                   min="0"
                   value={newGroupBollos}
                   onChange={(e) => setNewGroupBollos(e.target.value)}
-                  className="w-full px-3 py-2 rounded-xl border border-stone-200 text-sm"
+                  className="field tabular-nums"
                 />
               </div>
-              <button
-                type="submit"
-                className="px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-sm font-semibold flex items-center gap-1.5"
-              >
+              <button type="submit" className="btn-primary">
                 <Plus className="w-4 h-4" /> Agregar
               </button>
             </form>
 
             {groups.length === 0 ? (
-              <div className="bg-white rounded-2xl border border-stone-200 p-8 text-center space-y-3">
+              <div className="card p-8 text-center space-y-3">
                 <p className="text-stone-500 text-sm">No hay grupos familiares registrados.</p>
-                <button
-                  onClick={handleRestoreInitial}
-                  className="px-4 py-2 rounded-xl bg-amber-100 hover:bg-amber-200 text-amber-900 text-sm font-semibold inline-flex items-center gap-2"
-                >
+                <button onClick={handleRestoreInitial} className="btn-ghost mx-auto">
                   <RefreshCw className="w-4 h-4" /> Restaurar grupos iniciales (100 hallacas)
                 </button>
               </div>
@@ -848,7 +1120,7 @@ export default function App() {
                   return (
                     <div
                       key={g.id}
-                      className="bg-white rounded-2xl border border-stone-200 p-4 shadow-sm space-y-3"
+                      className="card-hover p-4 space-y-3"
                     >
                       <div className="flex items-center justify-between gap-2">
                         {isEditing ? (
@@ -861,18 +1133,18 @@ export default function App() {
                                 if (e.key === 'Enter') handleSaveGroupName(g.id);
                                 if (e.key === 'Escape') setEditingGroupId(null);
                               }}
-                              className="flex-1 px-2.5 py-1 rounded-lg border border-amber-400 text-sm font-semibold focus:outline-none"
+                              className="field flex-1 py-1 border-emerald-400 font-semibold"
                               autoFocus
                             />
                             <button
                               onClick={() => handleSaveGroupName(g.id)}
-                              className="p-1.5 rounded-lg bg-emerald-100 text-emerald-700"
+                              className="p-1.5 rounded-lg bg-emerald-100 text-emerald-700 active:scale-95 transition-all duration-150"
                             >
                               <Check className="w-4 h-4" />
                             </button>
                             <button
                               onClick={() => setEditingGroupId(null)}
-                              className="p-1.5 rounded-lg bg-stone-100 text-stone-600"
+                              className="p-1.5 rounded-lg bg-stone-100 text-stone-600 active:scale-95 transition-all duration-150"
                             >
                               <X className="w-4 h-4" />
                             </button>
@@ -883,15 +1155,15 @@ export default function App() {
                               setEditingGroupId(g.id);
                               setEditingGroupName(g.name);
                             }}
-                            className="flex items-center gap-2 text-left font-bold text-stone-800 hover:text-amber-700 group"
+                            className="flex items-center gap-2 text-left font-bold tracking-tight text-stone-800 hover:text-emerald-800 group"
                           >
                             <span>{g.name}</span>
-                            <Edit3 className="w-3.5 h-3.5 text-stone-400 group-hover:text-amber-600" />
+                            <Edit3 className="w-3.5 h-3.5 text-stone-400 group-hover:text-emerald-700" />
                           </button>
                         )}
                         <button
                           onClick={() => deleteDoc(docPath('hallacas_groups', g.id))}
-                          className="p-1.5 text-stone-400 hover:text-red-600 transition"
+                          className="p-1.5 text-stone-400 hover:text-rose-700 transition-all duration-150 active:scale-95"
                           title="Eliminar grupo"
                         >
                           <Trash2 className="w-4 h-4" />
@@ -900,7 +1172,7 @@ export default function App() {
 
                       <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
                         <div>
-                          <div className="text-xs text-stone-500 mb-1">Hallacas</div>
+                          <div className="label-xs">Hallacas</div>
                           <CountInput
                             label="hallacas"
                             value={Number(g.hallacas) || 0}
@@ -908,7 +1180,7 @@ export default function App() {
                           />
                         </div>
                         <div>
-                          <div className="text-xs text-stone-500 mb-1">Bollos</div>
+                          <div className="label-xs">Bollos</div>
                           <CountInput
                             label="bollos"
                             value={Number(g.bollos) || 0}
@@ -917,9 +1189,9 @@ export default function App() {
                         </div>
                       </div>
 
-                      <div className="pt-2 border-t border-stone-100 flex items-center justify-between text-xs text-stone-500">
-                        <span>Participación: <strong className="text-stone-700">{(row?.sharePct || 0).toFixed(1)}%</strong></span>
-                        <span>Aporte total: <strong className="text-amber-800">${(row?.totalOwed || 0).toFixed(2)}</strong></span>
+                      <div className="pt-2 border-t border-stone-100 flex items-center justify-between text-xs font-medium text-stone-500">
+                        <span>Participación: <strong className="text-stone-700 tabular-nums">{(row?.sharePct || 0).toFixed(1)}%</strong></span>
+                        <span>Aporte total: <strong className="text-emerald-800 tabular-nums">${(row?.totalOwed || 0).toFixed(2)}</strong></span>
                       </div>
                     </div>
                   );
@@ -931,38 +1203,38 @@ export default function App() {
 
         {/* TAB 2: LISTA DE COMPRAS */}
         {activeTab === 'compras' && (
-          <div className="space-y-4">
+          <div key="compras" className="space-y-4 animate-fade-in">
             {/* Controls bar */}
-            <div className="bg-white rounded-2xl border border-stone-200 p-4 shadow-sm flex flex-wrap items-center justify-between gap-3">
+            <div className="card p-4 flex flex-wrap items-center justify-between gap-3">
               <div className="flex flex-wrap items-center gap-3">
                 <div className="flex items-center gap-2">
-                  <span className="text-xs font-semibold text-stone-600">Merma:</span>
-                  <select
-                    value={globalConfig.mermaPct || 0}
-                    onChange={(e) => updateGlobal({ mermaPct: Number(e.target.value) })}
-                    className="px-2.5 py-1.5 rounded-lg border border-stone-200 text-sm bg-stone-50 font-medium"
-                  >
-                    {[0, 5, 10, 15, 20].map((m) => (
-                      <option key={m} value={m}>
-                        {m === 0 ? '0% (Sin merma)' : `+${m}%`}
-                      </option>
-                    ))}
-                  </select>
+                  <span className="badge-onoto">Merma</span>
+                  <Select
+                    size="sm"
+                    className="w-[9.5rem]"
+                    value={String(globalConfig.mermaPct || 0)}
+                    onChange={(v) => updateGlobal({ mermaPct: Number(v) })}
+                    options={[0, 5, 10, 15, 20].map((m) => ({
+                      value: String(m),
+                      label: m === 0 ? '0% (Sin merma)' : `+${m}%`,
+                    }))}
+                    placeholder=""
+                  />
                 </div>
 
                 <div className="flex rounded-xl bg-stone-100 p-1 text-xs font-semibold">
                   <button
                     onClick={() => updateGlobal({ costMode: 'items' })}
-                    className={`px-3 py-1.5 rounded-lg transition ${
-                      globalConfig.costMode !== 'invoices' ? 'bg-white text-amber-800 shadow-sm' : 'text-stone-500'
+                    className={`px-3 py-1.5 rounded-lg transition-all duration-150 active:scale-95 ${
+                      globalConfig.costMode !== 'invoices' ? 'bg-white text-emerald-800 shadow-sm' : 'text-stone-500'
                     }`}
                   >
                     Costo por ítems
                   </button>
                   <button
                     onClick={() => updateGlobal({ costMode: 'invoices' })}
-                    className={`px-3 py-1.5 rounded-lg transition ${
-                      globalConfig.costMode === 'invoices' ? 'bg-white text-amber-800 shadow-sm' : 'text-stone-500'
+                    className={`px-3 py-1.5 rounded-lg transition-all duration-150 active:scale-95 ${
+                      globalConfig.costMode === 'invoices' ? 'bg-white text-emerald-800 shadow-sm' : 'text-stone-500'
                     }`}
                   >
                     Total global / Facturas
@@ -970,109 +1242,91 @@ export default function App() {
                 </div>
               </div>
 
-              <button
-                onClick={copyShoppingList}
-                className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold flex items-center gap-1.5"
-              >
+              <button onClick={copyShoppingList} className="btn-whatsapp text-xs">
                 <Copy className="w-4 h-4" /> Copiar Lista WhatsApp
               </button>
             </div>
 
             {/* Global Invoices Mode */}
             {globalConfig.costMode === 'invoices' && (
-              <div className="bg-amber-50/70 rounded-2xl border border-amber-200 p-4 space-y-3">
-                <h3 className="font-bold text-amber-900 text-sm flex items-center gap-2">
-                  <DollarSign className="w-4 h-4" /> Facturas / Pagos Globales de Hallacas
+              <div className="rounded-2xl border border-emerald-200 bg-gradient-to-br from-emerald-50/80 to-stone-50 p-4 space-y-3 shadow-sm">
+                <h3 className="font-bold tracking-tight text-emerald-950 text-sm flex items-center gap-2">
+                  <DollarSign className="w-4 h-4 text-amber-500" /> Facturas / Pagos Globales de Hallacas
                 </h3>
-                <form onSubmit={handleAddInvoice} className="grid sm:grid-cols-6 gap-2">
-                  <input
-                    type="text"
-                    placeholder="Ej. Mercado carne y aliños"
-                    value={invDesc}
-                    onChange={(e) => setInvDesc(e.target.value)}
-                    className="sm:col-span-2 px-3 py-2 rounded-xl border border-stone-200 bg-white text-sm"
-                  />
-                  <input
-                    type="number"
-                    step="0.01"
-                    placeholder="Monto"
-                    value={invAmount}
-                    onChange={(e) => setInvAmount(e.target.value)}
-                    className="px-3 py-2 rounded-xl border border-stone-200 bg-white text-sm"
-                  />
-                  <select
-                    value={invCurrency}
-                    onChange={(e) => setInvCurrency(e.target.value)}
-                    className="px-2 py-2 rounded-xl border border-stone-200 bg-white text-sm"
-                  >
-                    <option value="USD">USD ($)</option>
-                    <option value="BS">Bs</option>
-                  </select>
-                  {invCurrency === 'BS' ? (
+                <form onSubmit={handleAddInvoice} className="space-y-3">
+                  <div className="grid sm:grid-cols-4 gap-2">
+                    <input
+                      type="text"
+                      placeholder="Ej. Mercado carne y aliños"
+                      value={invDesc}
+                      onChange={(e) => setInvDesc(e.target.value)}
+                      className="field sm:col-span-2"
+                    />
                     <input
                       type="number"
                       step="0.01"
-                      placeholder={`Tasa (${refRate})`}
-                      value={invRate}
-                      onChange={(e) => setInvRate(e.target.value)}
-                      className="px-3 py-2 rounded-xl border border-stone-200 bg-white text-sm"
+                      placeholder="Monto"
+                      value={invAmount}
+                      onChange={(e) => setInvAmount(e.target.value)}
+                      className="field"
                     />
-                  ) : (
-                    <select
-                      value={invPayer}
-                      onChange={(e) => setInvPayer(e.target.value)}
-                      className="px-2 py-2 rounded-xl border border-stone-200 bg-white text-sm"
-                    >
-                      <option value="">¿Quién pagó?</option>
-                      {groups.map((g) => (
-                        <option key={g.id} value={g.id}>{g.name}</option>
-                      ))}
-                    </select>
-                  )}
-                  <button
-                    type="submit"
-                    className="px-3 py-2 rounded-xl bg-amber-700 hover:bg-amber-800 text-white text-sm font-semibold"
-                  >
-                    Agregar
+                    <Select
+                      value={invCurrency}
+                      onChange={setInvCurrency}
+                      options={[
+                        { value: 'USD', label: 'USD ($)' },
+                        { value: 'BS', label: 'Bs' },
+                      ]}
+                      placeholder="Moneda"
+                    />
+                    {invCurrency === 'BS' && (
+                      <input
+                        type="number"
+                        step="0.01"
+                        placeholder={`Tasa (${refRate})`}
+                        value={invRate}
+                        onChange={(e) => setInvRate(e.target.value)}
+                        className="field sm:col-span-2"
+                      />
+                    )}
+                  </div>
+                  <PayersControl
+                    groups={groups}
+                    payers={invPayers}
+                    onChange={setInvPayers}
+                    totalAmount={invAmount}
+                    currency={invCurrency}
+                  />
+                  <button type="submit" className="btn-primary">
+                    <Plus className="w-4 h-4" /> Agregar factura
                   </button>
-                  {invCurrency === 'BS' && (
-                    <select
-                      value={invPayer}
-                      onChange={(e) => setInvPayer(e.target.value)}
-                      className="sm:col-span-2 px-2 py-2 rounded-xl border border-stone-200 bg-white text-sm"
-                    >
-                      <option value="">¿Quién pagó?</option>
-                      {groups.map((g) => (
-                        <option key={g.id} value={g.id}>{g.name}</option>
-                      ))}
-                    </select>
-                  )}
                 </form>
 
                 {(globalConfig.hallacaInvoices || []).length > 0 && (
                   <div className="space-y-2 pt-2">
                     {(globalConfig.hallacaInvoices || []).map((inv) => {
                       const usd = toUSD(inv.amount, inv.currency, inv.rate, refRate);
-                      const payer = groups.find((g) => g.id === inv.payerId)?.name || 'Sin asignar';
+                      const payerLabel =
+                        formatPayersSummary(resolvePayers(inv), groups, inv.currency) || 'Sin asignar';
                       return (
                         <div
                           key={inv.id}
-                          className="bg-white rounded-xl px-3 py-2 border border-amber-100 flex items-center justify-between text-sm"
+                          className="bg-white rounded-xl px-3 py-2.5 border border-amber-100/80 shadow-sm flex items-center justify-between gap-3 text-sm"
                         >
-                          <div>
+                          <div className="min-w-0">
                             <span className="font-semibold text-stone-800">{inv.description}</span>
-                            <span className="text-xs text-stone-500 ml-2">Pagó: {payer}</span>
+                            <div className="text-xs text-stone-500 mt-0.5 truncate">Pagaron: {payerLabel}</div>
                             {inv.currency === 'BS' && (
-                              <span className="text-xs text-amber-700 ml-2">
-                                (Bs {inv.amount} @ {inv.rate})
+                              <span className="badge-onoto mt-1 inline-flex">
+                                Bs {inv.amount} @ {inv.rate}
                               </span>
                             )}
                           </div>
-                          <div className="flex items-center gap-3">
-                            <span className="font-bold text-stone-800">${usd.toFixed(2)}</span>
+                          <div className="flex items-center gap-3 shrink-0">
+                            <span className="font-bold text-stone-800 tabular-nums">${usd.toFixed(2)}</span>
                             <button
                               onClick={() => handleDeleteInvoice(inv.id)}
-                              className="text-stone-400 hover:text-red-600"
+                              className="p-1.5 rounded-lg text-stone-400 hover:text-rose-700 hover:bg-rose-50 active:scale-95 transition-all duration-150"
                             >
                               <Trash2 className="w-4 h-4" />
                             </button>
@@ -1089,8 +1343,8 @@ export default function App() {
             {CATEGORIES.map((cat) => {
               const items = BASE_INGREDIENTS.filter((i) => i.category === cat);
               return (
-                <div key={cat} className="bg-white rounded-2xl border border-stone-200 overflow-hidden shadow-sm">
-                  <div className="bg-stone-50 px-4 py-2.5 border-b border-stone-200 font-bold text-sm text-stone-700">
+                <div key={cat} className="card overflow-hidden">
+                  <div className="bg-stone-50/90 px-4 py-2.5 border-b border-stone-200 font-bold uppercase tracking-wider text-xs text-stone-700 border-l-4 border-l-emerald-700">
                     {cat}
                   </div>
                   <div className="divide-y divide-stone-100">
@@ -1104,9 +1358,9 @@ export default function App() {
                       return (
                         <div
                           key={item.id}
-                          className={`px-4 py-3 flex flex-wrap items-center justify-between gap-3 ${
+                          className={`px-4 py-3 flex flex-wrap items-center justify-between gap-3 hover:bg-stone-50/80 transition-colors duration-150 ${
                             !enabled ? 'opacity-45 bg-stone-50' : ''
-                          }`}
+                          } ${st.checked ? 'opacity-60' : ''}`}
                         >
                           <div className="flex items-center gap-3 min-w-[200px]">
                             <input
@@ -1114,13 +1368,13 @@ export default function App() {
                               checked={Boolean(st.checked)}
                               disabled={!enabled}
                               onChange={(e) => updateItemState(item.id, { checked: e.target.checked })}
-                              className="w-4 h-4 accent-amber-600 rounded"
+                              className="w-4 h-4 accent-emerald-700 rounded"
                             />
                             <div>
                               <div className={`text-sm font-medium ${st.checked ? 'line-through text-stone-400' : 'text-stone-800'}`}>
                                 {item.name}
                               </div>
-                              <div className="text-xs text-amber-800 font-semibold">
+                              <div className="text-xs text-emerald-800 font-semibold tabular-nums">
                                 {display}
                                 {exact && <span className="text-stone-400 font-normal ml-1.5">({exact})</span>}
                               </div>
@@ -1131,37 +1385,38 @@ export default function App() {
                             {item.optional && (
                               <button
                                 onClick={() => updateItemState(item.id, { enabled: !enabled })}
-                                className={`text-xs px-2 py-1 rounded-lg border ${
-                                  enabled ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-stone-200 text-stone-500'
-                                }`}
+                                className={enabled ? 'badge-positive active:scale-95 transition-all duration-150' : 'badge-negative active:scale-95 transition-all duration-150'}
                               >
                                 {enabled ? 'Incluido' : 'Omitido'}
                               </button>
                             )}
 
                             {globalConfig.costMode !== 'invoices' && enabled && (
-                              <>
+                              <div className="flex flex-wrap items-start gap-2 justify-end">
                                 <input
                                   type="number"
                                   step="0.01"
                                   placeholder="Costo"
                                   value={st.amount ?? ''}
                                   onChange={(e) => updateItemState(item.id, { amount: e.target.value })}
-                                  className="w-20 px-2 py-1 rounded-lg border border-stone-200 text-xs"
+                                  className="field-sm w-[4.75rem]"
                                 />
-                                <select
+                                <Select
+                                  size="sm"
+                                  className="w-[4.5rem]"
                                   value={st.currency || 'USD'}
-                                  onChange={(e) =>
+                                  onChange={(v) =>
                                     updateItemState(item.id, {
-                                      currency: e.target.value,
+                                      currency: v,
                                       rate: st.rate || refRate,
                                     })
                                   }
-                                  className="px-1.5 py-1 rounded-lg border border-stone-200 text-xs bg-stone-50"
-                                >
-                                  <option value="USD">$</option>
-                                  <option value="BS">Bs</option>
-                                </select>
+                                  options={[
+                                    { value: 'USD', label: '$' },
+                                    { value: 'BS', label: 'Bs' },
+                                  ]}
+                                  placeholder="$"
+                                />
                                 {st.currency === 'BS' && (
                                   <input
                                     type="number"
@@ -1169,26 +1424,29 @@ export default function App() {
                                     placeholder="Tasa"
                                     value={st.rate ?? refRate}
                                     onChange={(e) => updateItemState(item.id, { rate: e.target.value })}
-                                    className="w-16 px-1.5 py-1 rounded-lg border border-amber-200 text-xs"
+                                    className="field-sm w-16 border-amber-200"
                                     title="Tasa congelada de esta compra"
                                   />
                                 )}
-                                <select
-                                  value={st.payerId || ''}
-                                  onChange={(e) => updateItemState(item.id, { payerId: e.target.value })}
-                                  className="px-1.5 py-1 rounded-lg border border-stone-200 text-xs bg-white max-w-[115px]"
-                                >
-                                  <option value="">Pagó...</option>
-                                  {groups.map((g) => (
-                                    <option key={g.id} value={g.id}>{g.name}</option>
-                                  ))}
-                                </select>
+                                <PayersControl
+                                  compact
+                                  groups={groups}
+                                  payers={resolvePayers(st)}
+                                  totalAmount={st.amount}
+                                  currency={st.currency || 'USD'}
+                                  onChange={(next) =>
+                                    updateItemState(item.id, {
+                                      payers: next,
+                                      payerId: next[0]?.groupId || '',
+                                    })
+                                  }
+                                />
                                 {usdVal > 0 && (
-                                  <span className="text-xs font-bold text-stone-700 w-14 text-right">
+                                  <span className="text-xs font-bold text-stone-700 w-14 text-right pt-1.5 tabular-nums">
                                     ${usdVal.toFixed(2)}
                                   </span>
                                 )}
-                              </>
+                              </div>
                             )}
                           </div>
                         </div>
@@ -1200,46 +1458,43 @@ export default function App() {
             })}
 
             {/* Custom Items */}
-            <div className="bg-white rounded-2xl border border-stone-200 p-4 shadow-sm space-y-3">
-              <h3 className="font-bold text-sm text-stone-700">Ítems extra personalizados</h3>
+            <div className="card p-4 space-y-3">
+              <h3 className="font-bold tracking-tight text-sm text-stone-800">Ítems extra personalizados</h3>
               <form onSubmit={handleAddCustomItem} className="flex flex-wrap gap-2">
                 <input
                   type="text"
                   placeholder="Ej. Bolsas de hielo"
                   value={newCustomName}
                   onChange={(e) => setNewCustomName(e.target.value)}
-                  className="flex-1 min-w-[160px] px-3 py-1.5 rounded-xl border border-stone-200 text-sm"
+                  className="field flex-1 min-w-[160px]"
                 />
                 <input
                   type="text"
                   placeholder="Cantidad"
                   value={newCustomQty}
                   onChange={(e) => setNewCustomQty(e.target.value)}
-                  className="w-28 px-3 py-1.5 rounded-xl border border-stone-200 text-sm"
+                  className="field w-28"
                 />
-                <button
-                  type="submit"
-                  className="px-3.5 py-1.5 rounded-xl bg-stone-800 text-white text-sm font-semibold"
-                >
+                <button type="submit" className="btn-primary">
                   Añadir
                 </button>
               </form>
               {customItems.map((ci) => (
-                <div key={ci.id} className="flex items-center justify-between text-sm pt-2 border-t border-stone-100">
+                <div key={ci.id} className="flex items-center justify-between text-sm pt-2 border-t border-stone-100 hover:bg-stone-50/80 transition-colors duration-150 rounded-lg px-1">
                   <label className="flex items-center gap-2">
                     <input
                       type="checkbox"
                       checked={Boolean(ci.checked)}
                       onChange={(e) => updateDoc(docPath('hallacas_custom_items', ci.id), { checked: e.target.checked })}
-                      className="accent-amber-600"
+                      className="accent-emerald-700"
                     />
-                    <span className={ci.checked ? 'line-through text-stone-400' : ''}>
+                    <span className={ci.checked ? 'line-through text-stone-400 opacity-60' : ''}>
                       {ci.name} <span className="text-xs text-stone-500">({ci.qty})</span>
                     </span>
                   </label>
                   <button
                     onClick={() => deleteDoc(docPath('hallacas_custom_items', ci.id))}
-                    className="text-stone-400 hover:text-red-600"
+                    className="text-stone-400 hover:text-rose-700 active:scale-95 transition-all duration-150"
                   >
                     <Trash2 className="w-4 h-4" />
                   </button>
@@ -1251,21 +1506,21 @@ export default function App() {
 
         {/* TAB 3: OTRAS COMPRAS */}
         {activeTab === 'otras' && (
-          <div className="space-y-4">
+          <div key="otras" className="space-y-4 animate-fade-in">
             <form
               onSubmit={handleAddOtherExpense}
-              className="bg-white rounded-2xl border border-stone-200 p-4 shadow-sm space-y-4"
+              className="card p-4 space-y-4"
             >
-              <h2 className="font-bold text-stone-800 text-base">
+              <h2 className="font-bold tracking-tight text-stone-800 text-base">
                 Registrar compra aparte (ej. Muchacho redondo, Pan de jamón, Bebidas)
               </h2>
-              <div className="grid sm:grid-cols-5 gap-2.5">
+              <div className="grid sm:grid-cols-4 gap-2.5">
                 <input
                   type="text"
                   placeholder="Descripción"
                   value={otherDesc}
                   onChange={(e) => setOtherDesc(e.target.value)}
-                  className="sm:col-span-2 px-3 py-2 rounded-xl border border-stone-200 text-sm"
+                  className="field sm:col-span-2"
                 />
                 <input
                   type="number"
@@ -1273,64 +1528,47 @@ export default function App() {
                   placeholder="Monto"
                   value={otherAmount}
                   onChange={(e) => setOtherAmount(e.target.value)}
-                  className="px-3 py-2 rounded-xl border border-stone-200 text-sm"
+                  className="field"
                 />
-                <select
+                <Select
                   value={otherCurrency}
-                  onChange={(e) => setOtherCurrency(e.target.value)}
-                  className="px-2.5 py-2 rounded-xl border border-stone-200 text-sm"
-                >
-                  <option value="USD">USD ($)</option>
-                  <option value="BS">Bs</option>
-                </select>
-                {otherCurrency === 'BS' ? (
+                  onChange={setOtherCurrency}
+                  options={[
+                    { value: 'USD', label: 'USD ($)' },
+                    { value: 'BS', label: 'Bs' },
+                  ]}
+                  placeholder="Moneda"
+                />
+                {otherCurrency === 'BS' && (
                   <input
                     type="number"
                     step="0.01"
                     placeholder={`Tasa (${refRate})`}
                     value={otherRate}
                     onChange={(e) => setOtherRate(e.target.value)}
-                    className="px-3 py-2 rounded-xl border border-amber-300 text-sm"
+                    className="field sm:col-span-2 border-amber-200"
                   />
-                ) : (
-                  <select
-                    value={otherPayer}
-                    onChange={(e) => setOtherPayer(e.target.value)}
-                    className="px-2.5 py-2 rounded-xl border border-stone-200 text-sm"
-                  >
-                    <option value="">¿Quién pagó?</option>
-                    {groups.map((g) => (
-                      <option key={g.id} value={g.id}>{g.name}</option>
-                    ))}
-                  </select>
                 )}
               </div>
 
-              {otherCurrency === 'BS' && (
-                <div>
-                  <select
-                    value={otherPayer}
-                    onChange={(e) => setOtherPayer(e.target.value)}
-                    className="px-3 py-2 rounded-xl border border-stone-200 text-sm"
-                  >
-                    <option value="">¿Quién pagó?</option>
-                    {groups.map((g) => (
-                      <option key={g.id} value={g.id}>{g.name}</option>
-                    ))}
-                  </select>
-                </div>
-              )}
+              <PayersControl
+                groups={groups}
+                payers={otherPayers}
+                onChange={setOtherPayers}
+                totalAmount={otherAmount}
+                currency={otherCurrency}
+              />
 
               <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-stone-600">
-                    Porcentaje por familia (Total: <span className={Math.abs(otherSplitTotal - 100) <= 0.5 ? 'text-emerald-600' : 'text-red-600'}>{otherSplitTotal.toFixed(1)}%</span>)
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <span className="text-xs font-medium text-stone-500">
+                    Porcentaje por familia (Total:{' '}
+                    <span className={`tabular-nums font-semibold ${Math.abs(otherSplitTotal - 100) <= 0.5 ? 'text-emerald-700' : 'text-rose-700'}`}>
+                      {otherSplitTotal.toFixed(1)}%
+                    </span>
+                    )
                   </span>
-                  <button
-                    type="button"
-                    onClick={handleDivideEqualOther}
-                    className="text-xs px-2.5 py-1 rounded-lg bg-amber-100 text-amber-900 font-semibold hover:bg-amber-200"
-                  >
+                  <button type="button" onClick={handleDivideEqualOther} className="btn-onoto">
                     Dividir en partes iguales
                   </button>
                 </div>
@@ -1348,7 +1586,7 @@ export default function App() {
                           onChange={(e) =>
                             setOtherSplits((prev) => ({ ...prev, [g.id]: parseFloat(e.target.value) || 0 }))
                           }
-                          className="w-16 px-2 py-1 rounded-lg border border-stone-200 bg-white text-right text-sm font-semibold"
+                          className="field-sm w-16 text-right font-semibold"
                         />
                         <span className="text-xs text-stone-500">%</span>
                       </div>
@@ -1360,7 +1598,7 @@ export default function App() {
               <button
                 type="submit"
                 disabled={Math.abs(otherSplitTotal - 100) > 0.5}
-                className="px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 disabled:opacity-40 text-white text-sm font-semibold"
+                className="btn-primary"
               >
                 Guardar compra aparte
               </button>
@@ -1369,22 +1607,25 @@ export default function App() {
             <div className="space-y-2.5">
               {otherExpenses.map((exp) => {
                 const usd = toUSD(exp.amount, exp.currency, exp.rate, refRate);
-                const payerName = groups.find((g) => g.id === exp.payerId)?.name || 'Sin asignar';
+                const payerLabel =
+                  formatPayersSummary(resolvePayers(exp), groups, exp.currency) || 'Sin asignar';
                 return (
-                  <div key={exp.id} className="bg-white rounded-2xl border border-stone-200 p-4 shadow-sm space-y-2">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <h3 className="font-bold text-stone-800">{exp.description}</h3>
-                        <p className="text-xs text-stone-500">
-                          Pagó: <strong>{payerName}</strong>
-                          {exp.currency === 'BS' && ` • Bs ${exp.amount} @ ${exp.rate}`}
+                  <div key={exp.id} className="card-hover p-4 space-y-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <h3 className="font-bold tracking-tight text-stone-800">{exp.description}</h3>
+                        <p className="text-xs font-medium text-stone-500 truncate">
+                          Pagaron: <strong className="text-stone-700">{payerLabel}</strong>
+                          {exp.currency === 'BS' && (
+                            <span className="badge-onoto ml-2 inline-flex">Bs {exp.amount} @ {exp.rate}</span>
+                          )}
                         </p>
                       </div>
-                      <div className="flex items-center gap-3">
-                        <span className="text-lg font-bold text-amber-800">${usd.toFixed(2)}</span>
+                      <div className="flex items-center gap-3 shrink-0">
+                        <span className="text-lg font-bold text-emerald-800 tabular-nums">${usd.toFixed(2)}</span>
                         <button
                           onClick={() => deleteDoc(docPath('hallacas_other_expenses', exp.id))}
-                          className="text-stone-400 hover:text-red-600"
+                          className="text-stone-400 hover:text-rose-700 active:scale-95 transition-all duration-150"
                         >
                           <Trash2 className="w-4 h-4" />
                         </button>
@@ -1395,7 +1636,7 @@ export default function App() {
                         const pct = Number(exp.splits?.[g.id]) || 0;
                         if (pct <= 0) return null;
                         return (
-                          <span key={g.id} className="text-xs bg-stone-100 text-stone-700 px-2.5 py-1 rounded-lg">
+                          <span key={g.id} className="text-xs bg-stone-100 text-stone-700 px-2.5 py-1 rounded-lg tabular-nums">
                             {g.name}: {pct}% (${(usd * (pct / 100)).toFixed(2)})
                           </span>
                         );
@@ -1410,65 +1651,69 @@ export default function App() {
 
         {/* TAB 4: DIVISIÓN Y WHATSAPP */}
         {activeTab === 'division' && (
-          <div className="space-y-4">
+          <div key="division" className="space-y-4 animate-fade-in">
             <div className="grid sm:grid-cols-3 gap-3">
-              <div className="bg-white rounded-2xl border border-stone-200 p-4 shadow-sm">
-                <div className="text-xs text-stone-500">Total Hallacas</div>
-                <div className="text-2xl font-bold text-stone-800">${hallacaFinancials.totalUSD.toFixed(2)}</div>
-                <div className="text-xs text-stone-400 mt-1">
+              <div className="card p-4">
+                <div className="text-xs font-medium text-stone-500">Total Hallacas</div>
+                <div className="text-2xl font-bold tracking-tight text-stone-800 tabular-nums">${hallacaFinancials.totalUSD.toFixed(2)}</div>
+                <div className="text-xs text-stone-400 mt-1 tabular-nums">
                   {totals.equiv > 0
                     ? `$${(hallacaFinancials.totalUSD / totals.equiv).toFixed(2)} / hallaca • $${((hallacaFinancials.totalUSD / totals.equiv) * 0.5).toFixed(2)} / bollo`
                     : 'Sin pedidos'}
                 </div>
               </div>
-              <div className="bg-white rounded-2xl border border-stone-200 p-4 shadow-sm">
-                <div className="text-xs text-stone-500">Otras Compras</div>
-                <div className="text-2xl font-bold text-stone-800">${settlement.totalOtherUSD.toFixed(2)}</div>
-                <div className="text-xs text-stone-400 mt-1">
+              <div className="card p-4">
+                <div className="text-xs font-medium text-stone-500">Otras Compras</div>
+                <div className="text-2xl font-bold tracking-tight text-stone-800 tabular-nums">${settlement.totalOtherUSD.toFixed(2)}</div>
+                <div className="text-xs text-stone-400 mt-1 tabular-nums">
                   Bs {(settlement.totalOtherUSD * refRate).toFixed(2)}
                 </div>
               </div>
-              <div className="bg-amber-50 rounded-2xl border border-amber-200 p-4 shadow-sm">
-                <div className="text-xs text-amber-800 font-medium">Total General</div>
-                <div className="text-2xl font-bold text-amber-900">${settlement.grandTotalUSD.toFixed(2)}</div>
-                <div className="text-xs text-amber-700 mt-1">
+              <div className="rounded-2xl border border-emerald-200 bg-emerald-50/60 p-4 shadow-sm">
+                <div className="text-xs text-emerald-800 font-medium">Total General</div>
+                <div className="text-2xl font-bold tracking-tight text-emerald-950 tabular-nums">${settlement.grandTotalUSD.toFixed(2)}</div>
+                <div className="text-xs text-emerald-700 mt-1 tabular-nums">
                   Bs {(settlement.grandTotalUSD * refRate).toFixed(2)} (a tasa {refRate})
                 </div>
               </div>
             </div>
 
             {/* Balance table */}
-            <div className="bg-white rounded-2xl border border-stone-200 overflow-x-auto shadow-sm">
+            <div className="card overflow-x-auto">
               <table className="w-full text-sm text-left">
-                <thead className="bg-stone-50 text-xs text-stone-500 uppercase border-b border-stone-200">
+                <thead className="bg-stone-50/90 text-xs text-stone-500 uppercase tracking-wider border-b border-stone-200">
                   <tr>
-                    <th className="px-4 py-3">Familia</th>
-                    <th className="px-4 py-3 text-right">Hallacas</th>
-                    <th className="px-4 py-3 text-right">Otras</th>
-                    <th className="px-4 py-3 text-right">Total a aportar</th>
-                    <th className="px-4 py-3 text-right">Ya pagó</th>
-                    <th className="px-4 py-3 text-right">Balance</th>
+                    <th className="px-4 py-3 font-bold">Familia</th>
+                    <th className="px-4 py-3 text-right font-bold">Hallacas</th>
+                    <th className="px-4 py-3 text-right font-bold">Otras</th>
+                    <th className="px-4 py-3 text-right font-bold">Total a aportar</th>
+                    <th className="px-4 py-3 text-right font-bold">Ya pagó</th>
+                    <th className="px-4 py-3 text-right font-bold">Balance</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-stone-100">
                   {settlement.rows.map((r) => (
-                    <tr key={r.id}>
+                    <tr key={r.id} className="hover:bg-stone-50/80 transition-colors duration-150">
                       <td className="px-4 py-3 font-semibold text-stone-800">
                         {r.name}
-                        <div className="text-xs font-normal text-stone-400">
+                        <div className="text-xs font-normal text-stone-400 tabular-nums">
                           {r.hallacas}h • {r.bollos}b ({r.sharePct.toFixed(1)}%)
                         </div>
                       </td>
-                      <td className="px-4 py-3 text-right">${r.hallacasOwed.toFixed(2)}</td>
-                      <td className="px-4 py-3 text-right">${r.otherOwed.toFixed(2)}</td>
-                      <td className="px-4 py-3 text-right font-bold">${r.totalOwed.toFixed(2)}</td>
-                      <td className="px-4 py-3 text-right text-emerald-700">${r.totalPaid.toFixed(2)}</td>
-                      <td
-                        className={`px-4 py-3 text-right font-bold ${
-                          r.balance >= 0 ? 'text-emerald-600' : 'text-red-600'
-                        }`}
-                      >
-                        {r.balance >= 0 ? `+$${r.balance.toFixed(2)}` : `-$${Math.abs(r.balance).toFixed(2)}`}
+                      <td className="px-4 py-3 text-right tabular-nums">${r.hallacasOwed.toFixed(2)}</td>
+                      <td className="px-4 py-3 text-right tabular-nums">${r.otherOwed.toFixed(2)}</td>
+                      <td className="px-4 py-3 text-right font-bold tabular-nums">${r.totalOwed.toFixed(2)}</td>
+                      <td className="px-4 py-3 text-right text-emerald-700 tabular-nums">${r.totalPaid.toFixed(2)}</td>
+                      <td className="px-4 py-3 text-right">
+                        <span
+                          className={`inline-flex font-bold tabular-nums px-2 py-0.5 rounded-lg border ${
+                            r.balance >= 0
+                              ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                              : 'bg-rose-50 text-rose-700 border-rose-200'
+                          }`}
+                        >
+                          {r.balance >= 0 ? `+$${r.balance.toFixed(2)}` : `-$${Math.abs(r.balance).toFixed(2)}`}
+                        </span>
                       </td>
                     </tr>
                   ))}
@@ -1477,8 +1722,8 @@ export default function App() {
             </div>
 
             {/* Splitwise transfers */}
-            <div className="bg-white rounded-2xl border border-stone-200 p-4 shadow-sm space-y-3">
-              <h3 className="font-bold text-stone-800 text-sm">Liquidación Inteligente (Quién le transfiere a quién)</h3>
+            <div className="card p-4 space-y-3">
+              <h3 className="font-bold tracking-tight text-stone-800 text-sm">Liquidación Inteligente (Quién le transfiere a quién)</h3>
               {settlement.transfers.length === 0 ? (
                 <p className="text-sm text-stone-500">
                   Asigna quién pagó cada compra o factura para calcular las transferencias automáticamente.
@@ -1486,18 +1731,15 @@ export default function App() {
               ) : (
                 <div className="space-y-2">
                   {settlement.transfers.map((t, idx) => (
-                    <div
-                      key={idx}
-                      className="flex flex-wrap items-center justify-between gap-2 bg-emerald-50/70 border border-emerald-200 rounded-xl px-4 py-3"
-                    >
+                    <div key={idx} className="transfer-card group">
                       <div className="flex items-center gap-2 text-sm font-semibold text-stone-800">
                         <span>{t.from}</span>
-                        <ArrowRight className="w-4 h-4 text-emerald-600" />
+                        <ArrowRight className="w-4 h-4 text-emerald-600 transfer-arrow" />
                         <span>{t.to}</span>
                       </div>
                       <div className="text-right">
-                        <div className="font-bold text-emerald-800">${t.amount.toFixed(2)}</div>
-                        <div className="text-xs text-emerald-700">Bs {(t.amount * refRate).toFixed(2)}</div>
+                        <div className="font-bold text-emerald-800 tabular-nums">${t.amount.toFixed(2)}</div>
+                        <div className="text-xs text-emerald-700 tabular-nums">Bs {(t.amount * refRate).toFixed(2)}</div>
                       </div>
                     </div>
                   ))}
@@ -1507,16 +1749,10 @@ export default function App() {
 
             {/* WhatsApp export buttons */}
             <div className="flex flex-wrap gap-3">
-              <button
-                onClick={copySummaryWhatsApp}
-                className="flex-1 py-3 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-sm flex items-center justify-center gap-2 shadow-sm"
-              >
+              <button onClick={copySummaryWhatsApp} className="btn-whatsapp flex-1 py-3">
                 <Copy className="w-4 h-4" /> Copiar Resumen y División para WhatsApp
               </button>
-              <button
-                onClick={copyShoppingList}
-                className="py-3 px-4 rounded-xl bg-stone-800 hover:bg-stone-900 text-white font-semibold text-sm flex items-center justify-center gap-2 shadow-sm"
-              >
+              <button onClick={copyShoppingList} className="btn-secondary py-3 px-4 bg-stone-800 text-white hover:bg-stone-900 hover:text-white border-stone-800">
                 <Copy className="w-4 h-4" /> Copiar Lista de Compras
               </button>
             </div>
